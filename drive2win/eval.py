@@ -62,14 +62,18 @@ def run_policy(client, policy_fn: Callable, duration: float = 60.0,
             max_stuck = max(max_stuck, stuck_streak)
             stuck_streak = 0
 
-        # position teleport detection (≈ crash + reset)
-        pos = state.get("position") or {}
-        if last_pos is not None and pos:
-            dx = pos.get("x", 0) - last_pos.get("x", 0)
-            dz = pos.get("z", 0) - last_pos.get("z", 0)
-            if (dx * dx + dz * dz) > 25.0:  # > 5 m in one frame
-                crashes += 1
-        last_pos = pos
+        # crash detection (check for platform signal first, then heuristic)
+        if state.get("crashed", False):
+            crashes += 1
+        else:
+            # position teleport detection (≈ crash + reset)
+            pos = state.get("position") or {}
+            if last_pos is not None and pos:
+                dx = pos.get("x", 0) - last_pos.get("x", 0)
+                dz = pos.get("z", 0) - last_pos.get("z", 0)
+                if (dx * dx + dz * dz) > 25.0:  # > 5 m in one frame
+                    crashes += 1
+        last_pos = state.get("position") or {}
 
         # policy step
         throttle, steering = policy_fn(state)

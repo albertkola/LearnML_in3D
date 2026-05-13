@@ -88,19 +88,21 @@ def main():
     info = client.stop_recording()
     print(f"\nStopped. Samples on the server: {info.get('sample_count', '?')}")
 
-    states_raw, actions = client.get_recording_as_arrays()
+    states_raw, actions, positions_full = client.get_recording_as_arrays()
     print(f"states shape   : {states_raw.shape}   (N, 12)")
     print(f"actions shape  : {actions.shape}      (N, 2)")
+    print(f"pos_full shape : {positions_full.shape}   (N, 2)  — high-Hz path samples")
 
     pos_arr = np.array([(p[1], p[2]) for p in positions], dtype=np.float32)
-    print(f"positions shape: {pos_arr.shape}     (M, 2)  — low-Hz path samples")
+    print(f"positions shape: {pos_arr.shape}     (M, 2)  — low-Hz polled samples")
 
     assert states_raw.shape[0] >= 5_000, (
         "Fewer than 5,000 samples. Drive more before saving."
     )
 
     out = f"data_{args.tag}.npz"
-    np.savez(out, states=states_raw, actions=actions, positions=pos_arr,
+    np.savez(out, states=states_raw, actions=actions, 
+             positions=pos_arr, positions_full=positions_full,
              seed=args.seed)
     print(f"Saved {out}")
 

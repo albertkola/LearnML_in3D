@@ -435,26 +435,54 @@ class GameClient:
         Download recording and convert to numpy arrays for training.
 
         Returns:
-            (states, actions) where:
+            (states, actions, positions) where:
             - states: np.ndarray of shape (N, 12) — normalized sensor features
             - actions: np.ndarray of shape (N, 2) — [throttle, steering]
+            - positions: np.ndarray of shape (N, 2) — [x, z] high-Hz paths
         """
         recording = self.get_recording()
         states = []
         actions = []
+        positions = []
         for sample in recording["samples"]:
             s = sample["state"]
             state_vec = [
-                s["speed"],
-                s["heading_error"],
-                s["checkpoint_distance"],
-                *s["rays"],
-                s["ground_friction"],
+                s.get("speed", 0),
+                s.get("heading_error", 0),
+                s.get("checkpoint_distance", 0),
+                *s.get("rays", [0] * 8),
+                s.get("ground_friction", 0),
             ]
-            action_vec = [sample["action"]["throttle"], sample["action"]["steering"]]
+            action_vec = [
+                sample["action"].get("throttle", 0),
+                sample["action"].get("steering", 0),
+            ]
             states.append(state_vec)
             actions.append(action_vec)
-        return np.array(states, dtype=np.float32), np.array(actions, dtype=np.float32)
+            
+            # High-Hz positions (if captured by the updated RecordingSystem)
+            pos_vec = [s.get("x", 0), s.get("z", 0)]
+            positions.append(pos_vec)
+            
+        return (
+            np.array(states, dtype=np.float32),
+            np.array(actions, dtype=np.float32),
+            np.array(positions, dtype=np.float32)
+        )
+
+    def get_recording_with_grid(self) -> dict:
+        """
+        Download recording including 32x32 terrain grid data per sample.
+
+        Returns:
+            Dict mirroring get_recording(), but with grid32 data in states.
+        """
+        self._check_session()
+        resp = self._http.get(
+            f"{self.server_url}/api/session/{self.session_id}/recording/grid"
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     # ── Map & Exploration ───────────────────────────────────────────────
 

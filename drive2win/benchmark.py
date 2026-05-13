@@ -66,7 +66,7 @@ def make_module_policy(module_path: str, weights_path: str):
 def run_benchmark(weights: str, runs: int = DEFAULT_RUNS, seed: int = DEFAULT_SEED,
                   duration: float = DEFAULT_DURATION, module: str | None = None,
                   server_url: str = "https://ml.ferit.tech", api_key: str = "None",
-                  player_name: str = "benchmark") -> dict:
+                  player_name: str = "benchmark", sim_speed: float = 1.0) -> dict:
     """Run `runs` benchmark laps and return aggregate metrics.
 
     The seed is sent to the server so terrain/checkpoint layout is
@@ -87,6 +87,8 @@ def run_benchmark(weights: str, runs: int = DEFAULT_RUNS, seed: int = DEFAULT_SE
                 config={"seed": seed, "wind_enabled": False},
             )
             client.connect_ws()
+            if sim_speed != 1.0:
+                client.configure(sim_speed=sim_speed)
             time.sleep(0.6)
             print(f"\n  run {i+1}/{runs}  session={session['session_id'][:8]}…")
             result = run_policy(client, policy, duration=duration, hz=20.0)
@@ -103,7 +105,7 @@ def run_benchmark(weights: str, runs: int = DEFAULT_RUNS, seed: int = DEFAULT_SE
     summary = score_runs(runs_out, TARGET_CHECKPOINTS)
     return {"summary": summary, "runs": runs_out, "config": {
         "weights": weights, "module": module, "seed": seed,
-        "runs": runs, "duration": duration,
+        "runs": runs, "duration": duration, "sim_speed": sim_speed,
     }}
 
 
@@ -118,6 +120,7 @@ def main():
     ap.add_argument("--server", default="https://ml.ferit.tech")
     ap.add_argument("--api-key", default="None")
     ap.add_argument("--out", default=None, help="Optional JSON output path")
+    ap.add_argument("--fast", action="store_true", help="Set sim_speed to 4x")
     args = ap.parse_args()
 
     print("benchmark.py — Drive2Win evaluator")
@@ -133,6 +136,7 @@ def main():
         module=args.module,
         server_url=args.server,
         api_key=args.api_key,
+        sim_speed=4.0 if args.fast else 1.0,
     )
 
     s = result["summary"]
