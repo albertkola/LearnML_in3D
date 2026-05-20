@@ -42,8 +42,13 @@ def my_backward(x, y_target, w, cache):
     y = cache["y"]
     # MSE -> d/dy
     dy = 2.0 * (y - y_target) / (n * y.shape[1])
-    # tanh derivative: 1 - tanh(z3)^2 = 1 - y^2
-    dz3 = dy * (1.0 - y * y)
+    # tanh derivative: 1 - tanh(z4)^2 = 1 - y^2
+    dz4 = dy * (1.0 - y * y)
+    dW4 = cache["a3"].T @ dz4
+    db4 = dz4.sum(axis=0)
+
+    da3 = dz4 @ w["W4"].T
+    dz3 = da3 * (cache["z3"] > 0)
     dW3 = cache["a2"].T @ dz3
     db3 = dz3.sum(axis=0)
 
@@ -56,7 +61,7 @@ def my_backward(x, y_target, w, cache):
     dz1 = da1 * (cache["z1"] > 0)
     dW1 = x.T @ dz1
     db1 = dz1.sum(axis=0)
-    return {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2, "W3": dW3, "b3": db3}
+    return {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2, "W3": dW3, "b3": db3, "W4": dW4, "b4": db4}
 
 
 def gradient_check():

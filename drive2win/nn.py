@@ -15,7 +15,7 @@ you've tried — the whole point of the first iteration is to write it.
 from __future__ import annotations
 import numpy as np
 
-H1, H2 = 64, 32
+H1, H2, H3 = 128, 64, 32
 N_IN, N_OUT = 12, 2
 
 
@@ -25,7 +25,7 @@ def forward(x: np.ndarray, w: dict) -> np.ndarray:
 
     Args:
         x: shape (N, 12) or (12,). Normalized inputs.
-        w: dict with keys W1, b1, W2, b2, W3, b3.
+        w: dict with keys W1, b1, W2, b2, W3, b3, W4, b4.
 
     Returns:
         Action of shape (N, 2) or (2,) in [-1, 1].
@@ -38,7 +38,9 @@ def forward(x: np.ndarray, w: dict) -> np.ndarray:
     z2 = a1 @ w["W2"] + w["b2"]
     a2 = np.maximum(0, z2)
     z3 = a2 @ w["W3"] + w["b3"]
-    y = np.tanh(z3)
+    a3 = np.maximum(0, z3)
+    z4 = a3 @ w["W4"] + w["b4"]
+    y = np.tanh(z4)
     return y[0] if single else y
 
 
@@ -48,8 +50,9 @@ def forward_all(x: np.ndarray, w: dict) -> dict:
     """
     z1 = x @ w["W1"] + w["b1"];   a1 = np.maximum(0, z1)
     z2 = a1 @ w["W2"] + w["b2"];  a2 = np.maximum(0, z2)
-    z3 = a2 @ w["W3"] + w["b3"];  y = np.tanh(z3)
-    return {"z1": z1, "a1": a1, "z2": z2, "a2": a2, "z3": z3, "y": y}
+    z3 = a2 @ w["W3"] + w["b3"];  a3 = np.maximum(0, z3)
+    z4 = a3 @ w["W4"] + w["b4"];  y = np.tanh(z4)
+    return {"z1": z1, "a1": a1, "z2": z2, "a2": a2, "z3": z3, "a3": a3, "z4": z4, "y": y}
 
 
 # ── Loss ─────────────────────────────────────────────────────────────────
@@ -59,7 +62,7 @@ def mse_loss(pred: np.ndarray, target: np.ndarray) -> float:
 
 # ── Backward pass ────────────────────────────────────────────────────────
 def backward(x: np.ndarray, y_target: np.ndarray, w: dict, cache: dict) -> dict:
-    """Return gradients dW1, db1, ..., dW3, db3 for one mini-batch.
+    """Return gradients dW1, db1, ..., dW4, db4 for one mini-batch.
 
     Args:
         x: (N, 12)
@@ -74,8 +77,13 @@ def backward(x: np.ndarray, y_target: np.ndarray, w: dict, cache: dict) -> dict:
     y = cache["y"]
     # MSE → d/dy
     dy = 2.0 * (y - y_target) / (n * y.shape[1])
-    # tanh derivative: 1 - tanh(z3)^2 = 1 - y^2
-    dz3 = dy * (1.0 - y * y)
+    # tanh derivative: 1 - tanh(z4)^2 = 1 - y^2
+    dz4 = dy * (1.0 - y * y)
+    dW4 = cache["a3"].T @ dz4
+    db4 = dz4.sum(axis=0)
+
+    da3 = dz4 @ w["W4"].T
+    dz3 = da3 * (cache["z3"] > 0)
     dW3 = cache["a2"].T @ dz3
     db3 = dz3.sum(axis=0)
 
@@ -88,7 +96,7 @@ def backward(x: np.ndarray, y_target: np.ndarray, w: dict, cache: dict) -> dict:
     dz1 = da1 * (cache["z1"] > 0)
     dW1 = x.T @ dz1
     db1 = dz1.sum(axis=0)
-    return {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2, "W3": dW3, "b3": db3}
+    return {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2, "W3": dW3, "b3": db3, "W4": dW4, "b4": db4}
 
 
 # ── Optimizer (Adam) ─────────────────────────────────────────────────────
@@ -126,8 +134,10 @@ def init_weights(seed: int = 0) -> dict:
         "b1": np.zeros(H1, dtype=np.float32),
         "W2": rng.normal(0, np.sqrt(2 / H1), (H1, H2)).astype(np.float32),
         "b2": np.zeros(H2, dtype=np.float32),
-        "W3": rng.normal(0, np.sqrt(1 / H2), (H2, N_OUT)).astype(np.float32),
-        "b3": np.zeros(N_OUT, dtype=np.float32),
+        "W3": rng.normal(0, np.sqrt(2 / H2), (H2, H3)).astype(np.float32),
+        "b3": np.zeros(H3, dtype=np.float32),
+        "W4": rng.normal(0, np.sqrt(1 / H3), (H3, N_OUT)).astype(np.float32),
+        "b4": np.zeros(N_OUT, dtype=np.float32),
     }
 
 
