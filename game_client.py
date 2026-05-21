@@ -388,12 +388,18 @@ class GameClient:
 
     # ── Recording (Behavioral Cloning) ──────────────────────────────────
 
-    def start_recording(self, sample_rate: int = 20) -> dict:
+    def start_recording(
+        self, sample_rate: int = 20, include_grid: bool = False
+    ) -> dict:
         """
         Start recording (state, action) pairs for behavioral cloning.
 
         Args:
             sample_rate: Samples per second (default: 20)
+            include_grid: When True, also capture the 32x32x4 terrain grid per
+                sample. Useful for CNN training. Adds ~5 MB per minute of
+                recording at 20 Hz — fine over localhost; expect a slower
+                download for long captures.
 
         Returns:
             Confirmation dict
@@ -401,7 +407,7 @@ class GameClient:
         self._check_session()
         resp = self._http.post(
             f"{self.server_url}/api/session/{self.session_id}/recording/start",
-            json={"sample_rate": sample_rate},
+            json={"sample_rate": sample_rate, "include_grid": include_grid},
         )
         resp.raise_for_status()
         return resp.json()
@@ -455,6 +461,68 @@ class GameClient:
             states.append(state_vec)
             actions.append(action_vec)
         return np.array(states, dtype=np.float32), np.array(actions, dtype=np.float32)
+
+    def get_recording_positions(self) -> np.ndarray:
+        """
+        Download the recorded agent positions as a numpy array.
+
+        Useful for plotting a high-Hz training path (denser than the 1 Hz
+        polled track from `eval.run_policy`).
+
+        Returns:
+            np.ndarray of shape (N, 2) — columns are [x, z].
+        """
+        recording = self.get_recording()
+        positions = []
+        for sample in recording["samples"]:
+            s = sample["state"]
+            positions.append([s.get("position_x", 0.0), s.get("position_z", 0.0)])
+        return np.array(positions, dtype=np.float32)
+
+    def get_recording_with_grid(self) -> tuple:
+        """
+        Download a grid-enabled recording and return arrays for CNN training.
+
+        Call `start_recording(..., include_grid=True)` first; without that
+        flag the per-sample grid will be missing and this method raises.
+
+        Returns:
+            (states, actions, grid_stack) where:
+            - states: np.ndarray of shape (N, 12) — same 12-feat vector as
+              `get_recording_as_arrays`
+            - actions: np.ndarray of shape (N, 2) — [throttle, steering]
+            - grid_stack: np.ndarray of shape (N, 32, 32, 4) — per-sample
+              terrain grid (heading-aligned). Bandwidth: ~5 MB per minute at
+              20 Hz; expect a slower download for long captures.
+        """
+        recording = self.get_recording()
+        states = []
+        actions = []
+        grids = []
+        for sample in recording["samples"]:
+            s = sample["state"]
+            if "grid32" not in s:
+                raise RuntimeError(
+                    "recording has no grid32 samples — start with "
+                    "start_recording(include_grid=True)"
+                )
+            state_vec = [
+                s["speed"],
+                s["heading_error"],
+                s["checkpoint_distance"],
+                *s["rays"],
+                s["ground_friction"],
+            ]
+            action_vec = [sample["action"]["throttle"], sample["action"]["steering"]]
+            states.append(state_vec)
+            actions.append(action_vec)
+            grids.append(s["grid32"])
+        grid_stack = np.array(grids, dtype=np.float32).reshape(-1, 32, 32, 4)
+        return (
+            np.array(states, dtype=np.float32),
+            np.array(actions, dtype=np.float32),
+            grid_stack,
+        )
 
     # ── Map & Exploration ───────────────────────────────────────────────
 
