@@ -16,11 +16,12 @@ This document is the practical how-to for those iterations. It tells you exactly
 | Recording the 12-feature vector | ✅ works | `client.start_recording(sample_rate=20)` |
 | Recording the 32×32×4 terrain grid | ✅ works | `client.start_recording(..., include_grid=True)` then `client.get_recording_with_grid()` |
 | Per-frame grid via REST at inference | ✅ works (HTTP, adds latency) | `client.get_grid_observation()` |
-| Per-frame grid in the WS state broadcast | ❌ **not wired** | `src/main.ts:127-144` — broadcast omits `grid32` |
+| **Per-frame grid computed locally at 20 Hz (no round-trip)** | ✅ **works** | `client.cache_world_map()` once + `client.get_grid_local()` per tick |
+| Per-frame grid in the WS state broadcast | ❌ not wired (and not needed — `get_grid_local()` makes it irrelevant for static-terrain modes) | `src/main.ts:127-144` |
 | Saving NumPy weights (`.npz`) | ✅ works | `drive2win/nn.py:save/load` |
 | Loading PyTorch weights (`.pt`) | ✅ works | you write the loader inside your `make_policy` |
 
-The one consequential gap is the last one: at inference time, `run_policy` calls `policy_fn(state)` with the WS state dict, and that dict doesn't contain `grid32`. A pure-CNN policy needs the grid every frame. The three workarounds are spelled out in section 5.
+Live CNN inference used to be the friction point of this doc: the WS state broadcast omits `grid32`, so a pure-CNN policy used to need a REST round-trip per tick (slow) or an instructor change. That is **no longer the case**. The SDK now ships `cache_world_map()` + `get_grid_local()`: download the static world snapshot once at session start, then compute the heading-aligned 32×32 grid in numpy each tick. Zero per-tick network cost, sub-millisecond latency, identical numerics to the server for the three static channels. Section 5 walks through the new wiring; the old REST workaround stays as a fallback for `anomaly_arena` where the terrain mutates.
 
 ---
 
@@ -286,64 +287,37 @@ if __name__ == "__main__":
     main()
 ```
 
-### Inference — the gap, and three workarounds
+### Inference — `get_grid_local()` (the new wiring)
 
-The WS broadcast (`src/main.ts:127-144`) does **not** include `grid32`. `policy_fn(state)` sees only `state["sensors"]` (the 12-vector). You have three options:
+`policy_fn(state)` still only sees the 12-vector — the WS broadcast does not stream the grid. But you no longer need the broadcast, because the SDK can build the grid offline from a one-shot static snapshot. The protocol is:
 
-#### Option A (cleanest, needs the instructor) — add `grid32` to the WS state
+1. **Cache once** at session start: `client.cache_world_map()`. This downloads the 100×100 terrain-type IDs, elevations, obstacles, and checkpoint positions. ~80 KB, single round-trip.
+2. **Per tick**, call `client.get_grid_local()`. This reads `state["position"]` + `state["heading"]` (now in the broadcast) and rotates the 32×32 window over the cached arrays in numpy. Sub-millisecond, no server hop.
 
-Single-line change in `src/main.ts`. The broadcast becomes:
+Channels 0–2 (terrain, elevation, obstacles) come straight from the snapshot — they're static for a given seed. Channel 3 (nav gradient to next checkpoint) is recomputed each tick from cached checkpoint positions + the live `checkpoints_completed` counter, so it stays correct as the agent advances.
 
-```ts
-sensors: {
-  speed: agent.getSpeed(),
-  // ...existing fields...
-  grid32: sensorSystem.getGrid32x32().data,   // <— add this
-}
-```
-
-Then in your policy:
+Wiring it into a CNN policy:
 
 ```python
-def policy(state):
-    g = np.array(state["sensors"]["grid32"], dtype=np.float32)  # (32, 32, 4)
-    g = torch.from_numpy(g).permute(2, 0, 1).unsqueeze(0)        # (1, 4, 32, 32)
-    with torch.no_grad():
-        y = model(g)[0].numpy()
-    return clip_action(y)
-```
-
-If you want to try a CNN, **ask the instructor** to make this change before you start iterating. It's listed as an open item under "Recording — needed for the path overlay and for any CNN iteration" in `INSTRUCTOR_TODO.md` (the recording-time `include_grid` is done; the live-broadcast piece is the missing companion). Bandwidth at 20 Hz over WS is ~80 KB/s per client — fine.
-
-#### Option B (works today, slower) — pull the grid via REST inside your policy
-
-Your `make_policy` opens its own GameClient pointed at the same server, and every step calls `/sensors/grid32`. The benchmark already creates a client with `api_key` set — you can pass the same key and read the active session id from the broadcast.
-
-The catch: there is no clean way for `make_policy(weights_path)` to learn the session id, because the session is created **after** the policy is built. Workaround:
-
-```python
-# drive2win/cnn_rest.py
-import os, numpy as np, torch
-from game_client import GameClient
+# drive2win/cnn.py
+import torch
 from .normalize import clip_action
+from .cnn_model import TerrainCNN          # the class from section 5
 
 def make_policy(weights_path):
     model = TerrainCNN()
     model.load_state_dict(torch.load(weights_path, map_location="cpu"))
     model.eval()
-    side_client = GameClient(
-        os.environ.get("DRIVE2WIN_SERVER", "https://ml.ferit.tech"),
-        os.environ.get("DRIVE2WIN_API_KEY", "None"),
-    )
+    primed = {"done": False}
 
-    def policy(state):
-        # state has no session id; we need one. Stash it from the env or
-        # discover it from the active client by listing your sessions.
-        # Practical hack: write the active session id to a temp file from
-        # a wrapper script; read it here.
-        if not side_client.session_id:
-            side_client.session_id = os.environ["DRIVE2WIN_ACTIVE_SESSION"]
-        g = side_client.get_grid_observation()                  # (4, 32, 32)
+    def policy(state, client=None):
+        # 03_benchmark.py passes the active GameClient as `client` so
+        # policies can call back into it. (If your benchmark version is
+        # older, see the small client= patch below.)
+        if not primed["done"]:
+            client.cache_world_map()
+            primed["done"] = True
+        g = client.get_grid_local()                              # (4, 32, 32)
         with torch.no_grad():
             y = model(torch.from_numpy(g).unsqueeze(0))[0].numpy()
         return clip_action(y)
@@ -351,11 +325,40 @@ def make_policy(weights_path):
     return policy
 ```
 
-This adds a synchronous HTTP round-trip per step, so your effective control rate drops below 20 Hz. It works for an exploratory iteration but is not how you'd run a tournament. Use option A.
+If your local `03_benchmark.py` predates the `client` kwarg, the one-liner patch is to capture the active client at the top of `make_policy` via a module-level register (the project already uses this pattern in `eval.py`). Easiest version: prime the snapshot once *outside* the policy, then close over a captured `client`:
 
-#### Option C (always available) — skip the grid; do path 2 instead
+```python
+def make_policy(weights_path, client):           # called once before the loop
+    model = TerrainCNN(); model.load_state_dict(...); model.eval()
+    client.cache_world_map()
 
-Path 2 (temporal MLP) gives you more model capacity than the baseline MLP without needing the grid at inference. If the instructor change for option A is not in place, this is what you ship.
+    def policy(state):
+        g = client.get_grid_local()
+        ...
+```
+
+### When `get_grid_local()` is *not* the answer
+
+The cache is a snapshot. It goes stale the moment the terrain mutates underneath it. Two situations:
+
+1. **`anomaly_arena` mode.** Terrain anomalies rewrite the underlying grid in place. Don't use the cache here — fall back to `client.get_grid_observation()` (REST round-trip per tick) or to a non-grid architecture (path 2).
+2. **You call `client.configure(terrain_seed=...)` mid-session.** This re-rolls terrain. Call `client.cache_world_map(force=True)` to refresh.
+
+For ordinary `time_trial` and `free_play` runs — the modes `03_benchmark.py` exercises — neither applies, so `get_grid_local()` is the right default.
+
+### Older fallback — REST round-trip per tick
+
+If for some reason you can't use the local-grid path, the REST helper still works:
+
+```python
+def policy(state):
+    g = side_client.get_grid_observation()                       # (4, 32, 32)
+    with torch.no_grad():
+        y = model(torch.from_numpy(g).unsqueeze(0))[0].numpy()
+    return clip_action(y)
+```
+
+This adds a synchronous HTTP round-trip per step, so your effective control rate drops below 20 Hz. Workable for an exploratory iteration; not how you'd run a tournament. Use `get_grid_local()` unless you're in `anomaly_arena`.
 
 ---
 
@@ -387,19 +390,24 @@ class Hybrid(nn.Module):
         return self.head(torch.cat([self.mlp(x12), self.cnn(grid)], dim=1))
 ```
 
-The inference-time gap from path 3 applies identically: the grid is not in the WS state. You need option A (instructor change) or option B (REST polling) for this to work in `03_benchmark.py`.
-
-If option A is in place, your policy is just:
+At inference time you get the grid the same way as the pure-CNN path — via `client.get_grid_local()` (after a one-shot `cache_world_map()`). Your policy is just:
 
 ```python
-def policy(state):
-    x12 = torch.from_numpy(sensors_to_input(state["sensors"])).unsqueeze(0)
-    g = np.array(state["sensors"]["grid32"], dtype=np.float32)
-    g = torch.from_numpy(g).permute(2, 0, 1).unsqueeze(0)
-    with torch.no_grad():
-        y = model(x12, g)[0].numpy()
-    return clip_action(y)
+def make_policy(weights_path, client):
+    model = Hybrid(); model.load_state_dict(...); model.eval()
+    client.cache_world_map()
+
+    def policy(state):
+        x12 = torch.from_numpy(sensors_to_input(state["sensors"])).unsqueeze(0)
+        g = torch.from_numpy(client.get_grid_local()).unsqueeze(0)   # (1, 4, 32, 32)
+        with torch.no_grad():
+            y = model(x12, g)[0].numpy()
+        return clip_action(y)
+
+    return policy
 ```
+
+(Same `anomaly_arena` caveat as path 3 — swap in `get_grid_observation()` for that mode.)
 
 ---
 
@@ -435,8 +443,8 @@ def policy(state):
 | Deeper / wider NumPy MLP | no | `data_<tag>.npz` (states + actions) | none — edit `drive2win/nn.py` and use the default path |
 | PyTorch MLP / LeakyReLU / dropout | no | `data_<tag>.npz` | `drive2win/torch_mlp.py` |
 | Temporal MLP (K-frame stack) | no | `data_<tag>.npz` | `drive2win/temporal.py` |
-| CNN over `grid32` | **yes** (add `grid32` to WS broadcast) — or workaround | `data_<tag>.npz` with grids | `drive2win/cnn.py` |
-| Hybrid CNN + MLP | **yes** (same as above) | `data_<tag>.npz` with grids | `drive2win/hybrid.py` |
+| CNN over `grid32` | no — use `cache_world_map()` + `get_grid_local()` | `data_<tag>.npz` with grids | `drive2win/cnn.py` |
+| Hybrid CNN + MLP | no — same path as CNN | `data_<tag>.npz` with grids | `drive2win/hybrid.py` |
 | Ensemble of two seeds | no | reuse existing data | a `make_policy` that loads two checkpoints and averages |
 
 If you're not sure where to start, pick the cheapest row that addresses your current worst metric: low completion → temporal MLP. High crashes on obstacle rounds → hybrid (after the server change). Variance between seeds → ensemble.
