@@ -1,5 +1,5 @@
 # Drive2Win — Project Checkpoint & Agent Handoff
-**Last updated:** 2026-05-27 | **Read this entire file before touching any code.**
+**Last updated:** 2026-05-27 (Session 3) | **Read this entire file before touching any code.**
 
 ---
 
@@ -254,3 +254,135 @@ RAY_MAX  = 50.0   # ray values clipped to [0, 1]
 # heading_error divided by pi → [-1, 1]
 # ground_friction already [0, 1] — pass through unchanged
 ```
+
+---
+
+## 11. SESSION 3 — HYBRID POLICY + TOURNAMENT FORMAT (2026-05-27)
+
+### 11.1 What was built
+
+**`train_v4.py`** — Combines `data_v1.npz` + `data_v2_recovery42.npz` (18,576 samples), mirror augmentation → 37,152 samples, trains NumPy MLP 300 epochs. Saves `nav_v4.npz` (best val=0.1885). This is the **tournament weight file**.
+
+**`train_v5.py`** — All 4 data files combined (45k samples → 90k augmented). Saves `nav_v5.npz`. Tested but found to dilute seed-42 performance vs nav_v4.npz. Not recommended for tournament.
+
+**`drive2win/agent.py`** — Adapter module so `03_benchmark.py --module drive2win.agent` uses the hybrid policy. Required for benchmark JSON generation.
+
+**`99_compete.py`** — Tournament entry point with hybrid policy + competition runner.
+
+---
+
+### 11.2 Tournament Format (CRITICAL — discovered from professor's files)
+
+**Professor provided:** `test_bot.py` (smoke test) + `TOURNAMENT.md` (full guide).
+
+**Connection — room-based WebSocket, NOT the old competition API:**
+```
+wss://ml.ferit.tech/ws/room/bot?room=<room>&name=<name>
+```
+After connect: send `{"type":"ready","ready":true}`
+
+**Obs format** (different from `state["sensors"]`):
+```python
+obs["speed"]                         # was sensors["speed"]
+obs["navigation"]["heading_error"]   # was sensors["heading_error"]
+obs["navigation"]["distance"]        # was sensors["checkpoint_distance"]
+obs["rays"]                          # was sensors["rays"]
+obs["ground_friction"]               # range [0.4, 1.2] — ice=0.4, rock=1.2
+obs["checkpoints_passed"]            # cumulative across all rounds
+obs["race_phase"]                    # "lobby"/"countdown"/"racing"/"round_end"/"finished"
+```
+
+`_obs_to_state(obs)` adapter in `99_compete.py` converts to our policy's expected format.
+
+**Steering confirmed:** positive steering = right turn → `STEER_SIGN = -1` is correct.
+
+**No API key needed** for tournament.
+
+**Tournament day command:**
+```bash
+python 99_compete.py --competition --room final2026 --name albertkola --weights nav_v4.npz
+```
+Replace `final2026` with room name professor announces.
+
+**Smoke test** (run before tournament to confirm connectivity):
+```bash
+python test_bot.py --host ml.ferit.tech --secure --room albertkola
+```
+Should print: `connected — sending ready` and `bot_key=...`
+
+---
+
+### 11.3 Current Hybrid Policy (99_compete.py)
+
+Four components, nothing else:
+
+**1. Arrow P-controller** (navigation)
+```python
+arr_steer = clip(STEER_SIGN * heading_error * ARROW_STEER_KP, -1, 1)
+thr = 1.0  # full throttle always
+```
+
+**2. Ray-based ML steering blend** (obstacle avoidance)
+```python
+front_clearance = min(x[3], x[4], x[10])  # front, front-left, front-right rays
+obstacle_factor = clip(1 - front_clearance / OBSTACLE_THRESH, 0, 1)
+steer = (1 - obstacle_factor) * arr_steer + obstacle_factor * ml_steer
+```
+ML only controls steering, never throttle.
+
+**3. 3-phase recovery** (stuck handling)
+```
+Phase 1 — 20 frames (1s):  thr=-1.0, steer=0.0    → straight back ~5m
+Phase 2 —  4 frames (0.2s): thr=-1.0, steer=±0.5   → angle slightly while backing ~1m
+Phase 3 — 20 frames (1s):  thr=+1.0, steer=arrow   → full speed forward to checkpoint
+EMA flushed when entering phase 3
+```
+Triggers after 60 frames (3s) at speed < 0.3 m/s, with 100-frame grace period at spawn.
+
+**4. EMA smoothing** (α=0.7, frame-1 bypass for instant start)
+
+---
+
+### 11.4 Key Constants
+
+```python
+STEER_SIGN          = -1.0   # confirmed: positive steering = right turn
+ARROW_STEER_KP      = 0.9    # heading_error → steering gain
+OBSTACLE_THRESH     = 0.35   # 17.5m ray threshold for ML blend
+GRACE_FRAMES        = 100    # skip stuck detection at spawn
+STUCK_THRESH        = 60     # 3 seconds at low speed → trigger recovery
+RECOVERY_STRAIGHT   = 20     # frames straight reverse
+RECOVERY_STEER_BACK = 4      # frames reverse + gentle steer
+RECOVERY_FORWARD    = 20     # frames full throttle forward
+EMA_ALPHA           = 0.7
+```
+
+---
+
+### 11.5 Best Result
+
+**11/12 checkpoints** in a single 300-second run on seed 42, 0 crashes.
+At 5 checkpoints per 60 seconds: ~25 checkpoints per 5-minute round.
+
+---
+
+### 11.6 Lessons Learned (Session 3)
+
+- **Too many parameters = interactions break things.** Every feature added on top of the working state made it worse. The 11/12 result came from 4 simple components. Keep it minimal.
+- **Grid obstacle avoidance doesn't work.** Channel 2 (obstacles) marks course walls the same as real obstacles → constant false positives → car steers off course.
+- **ML throttle must be excluded from the blend.** Recovery training data taught the model to reverse near walls. When ML controlled throttle near obstacles, the car would slow or reverse mid-lap.
+- **STEER_SIGN = -1 confirmed** from both data correlation (-0.196) and TOURNAMENT.md ("positive steering turns right").
+- **Potential field (ray repulsion) didn't work** — course walls constantly activate the repulsion and override the arrow.
+- **Ground friction range is [0.4, 1.2]**, not [0, 1]. ice=0.4, rock=1.2.
+- **The tournament uses rooms, not competition sessions.** Old `join_competition()` → wrong endpoint entirely.
+
+---
+
+### 11.7 What the Next Agent Should Do
+
+1. **Run smoke test** to confirm connectivity: `python test_bot.py --host ml.ferit.tech --secure --room albertkola`
+2. **Test on seeds 7 and 99** before tournament: `python 99_compete.py --weights nav_v4.npz --seed 7 --duration 60`
+3. **Benchmark and commit** `benchmarks/v6-final.json` for process grade
+4. **Tournament**: Professor announces room name → run `python 99_compete.py --competition --room <room> --name albertkola`
+5. **Do not retrain** unless nav_v4.npz is missing — retraining risks worse performance
+6. **Do not add new features** to the policy — every addition has broken it. The 4-component policy is what works.
