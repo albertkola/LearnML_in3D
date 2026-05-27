@@ -16,11 +16,12 @@ from .normalize import clip_action
 
 # ── Defaults (all overridable via make_smoothed_policy kwargs) ──────────────
 EMA_ALPHA       = 0.7    # higher = faster response, lower = smoother output
-STUCK_THRESHOLD = 40     # frames of speed < STUCK_SPEED before override fires
+STUCK_THRESHOLD = 60     # frames of speed < STUCK_SPEED before override fires
 STUCK_SPEED     = 0.3    # m/s — what counts as "not moving"
-RECOVERY_FRAMES = 30     # how many frames to hold the recovery action
-RECOVERY_THROTTLE = -0.7 # reverse thrust
-RECOVERY_STEER    = 0.9  # hard turn magnitude
+RECOVERY_FRAMES = 40     # how many frames to hold the recovery action
+RECOVERY_THROTTLE = -0.8 # reverse thrust
+RECOVERY_STEER    = 1.0  # hard turn magnitude
+GRACE_FRAMES    = 100    # frames at start of run before stuck detection activates
 
 
 def make_smoothed_policy(
@@ -28,6 +29,7 @@ def make_smoothed_policy(
     alpha: float = EMA_ALPHA,
     stuck_threshold: int = STUCK_THRESHOLD,
     recovery_frames: int = RECOVERY_FRAMES,
+    grace_frames: int = GRACE_FRAMES,
 ):
     """Wrap a raw policy with EMA smoothing and automatic stuck-recovery.
 
@@ -36,6 +38,8 @@ def make_smoothed_policy(
         alpha: EMA coefficient in (0, 1]. Higher = less smoothing.
         stuck_threshold: Consecutive slow frames before recovery kicks in.
         recovery_frames: How many frames to hold the recovery action.
+        grace_frames: Frames at session start where stuck detection is disabled.
+                      Prevents false recovery at spawn (speed=0 looks like stuck).
 
     Returns:
         A new policy callable with the same (state_dict) -> (float, float)
@@ -43,6 +47,7 @@ def make_smoothed_policy(
         drive2win.benchmark.
     """
     ema = np.array([0.0, 0.0], dtype=np.float32)
+    frame_count   = [0]
     stuck_count   = [0]
     recovery_left = [0]
     recovery_dir  = [1.0]
@@ -50,6 +55,7 @@ def make_smoothed_policy(
     def policy(state):
         sensors = state.get("sensors", {})
         speed   = float(sensors.get("speed", 0.0))
+        frame_count[0] += 1
 
         # ── Stuck-recovery path ─────────────────────────────────────────
         if recovery_left[0] > 0:
@@ -63,25 +69,23 @@ def make_smoothed_policy(
                 ema[:] = 0.0
             return clip_action(np.array([throttle, steering], dtype=np.float32))
 
-        # ── Stuck detection ─────────────────────────────────────────────
-        if speed < STUCK_SPEED:
-            stuck_count[0] += 1
-        else:
-            stuck_count[0] = 0
+        # ── Stuck detection (skip during grace period at session start) ──
+        if frame_count[0] > grace_frames:
+            if speed < STUCK_SPEED:
+                stuck_count[0] += 1
+            else:
+                stuck_count[0] = 0
 
-        if stuck_count[0] >= stuck_threshold:
-            # Choose steer direction: turn away from the wall using heading_error.
-            # Positive heading_error means we're pointing left of target → steer right.
-            he = float(sensors.get("heading_error", 0.0))
-            recovery_dir[0]  = -1.0 if he >= 0 else 1.0
-            recovery_left[0] = recovery_frames
-            stuck_count[0]   = 0
-            # Reset EMA so we don't inherit the stuck-state smoothed output
-            ema[:] = 0.0
-            return clip_action(
-                np.array([RECOVERY_THROTTLE, recovery_dir[0] * RECOVERY_STEER],
-                         dtype=np.float32)
-            )
+            if stuck_count[0] >= stuck_threshold:
+                he = float(sensors.get("heading_error", 0.0))
+                recovery_dir[0]  = -1.0 if he >= 0 else 1.0
+                recovery_left[0] = recovery_frames
+                stuck_count[0]   = 0
+                ema[:] = 0.0
+                return clip_action(
+                    np.array([RECOVERY_THROTTLE, recovery_dir[0] * RECOVERY_STEER],
+                             dtype=np.float32)
+                )
 
         # ── Normal path: run the underlying policy + EMA ────────────────
         raw = policy_fn(state)

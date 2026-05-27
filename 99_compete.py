@@ -60,7 +60,8 @@ def _run_round(client, policy, duration: float, seed: int, player: str,
     client.connect_ws()
     time.sleep(1.0)
 
-    wrapped = make_smoothed_policy(policy, alpha=alpha, stuck_threshold=stuck)
+    wrapped = make_smoothed_policy(policy, alpha=alpha, stuck_threshold=stuck,
+                                   grace_frames=100)
     print(f"  Running {duration:.0f}s — seed {seed}...")
     result = run_policy(client, wrapped, duration=duration)
 
@@ -109,6 +110,10 @@ def main():
         result = _run_round(client, policy, args.duration, args.seed,
                             args.player, args.alpha, args.stuck)
         print(f"\nPractice done: {result['checkpoints_passed']} checkpoints.")
+        import json, pathlib
+        out = pathlib.Path("practice_result.json")
+        out.write_text(json.dumps(result, indent=2, default=float))
+        print(f"Saved {out}")
         return
 
     # ── Tournament mode: prompt for each round's seed ───────────────────
