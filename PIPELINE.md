@@ -26,44 +26,36 @@ Watch the val_loss — aim for < 0.08. If train_loss << val_loss, overfitting.
 
 ---
 
-## STEP 3 — Benchmark the numpy v2-simple baseline (get process grade entry)
+## IMPORTANT — The game server requires a browser tab to run the simulation
 
-```
-python 03_benchmark.py --tag v2-simple --weights nav_v2-simple.npz --seed 42
-python 03_benchmark.py --tag v2-simple-s7 --weights nav_v2-simple.npz --seed 7
-```
-
-Produces: `benchmarks/v2-simple.json` etc. — shows improvement over v1.
+Use `03_benchmark_live.py` (not `03_benchmark.py`) for all manual benchmarks.
+It opens ONE session, asks you to open it in the browser, then runs all laps
+automatically. You only need to open the browser ONCE per benchmark tag.
 
 ---
 
-## STEP 4 — Benchmark the new PyTorch model on 3 seeds
+## STEP 3 — Benchmark v2-simple baseline (browser required)
 
 ```
-python 03_benchmark.py --tag v3-torch --weights nav_v3-torch.pt --module drive2win.torch_mlp --seed 42
-python 03_benchmark.py --tag v3-torch-s7 --weights nav_v3-torch.pt --module drive2win.torch_mlp --seed 7
-python 03_benchmark.py --tag v3-torch-s99 --weights nav_v3-torch.pt --module drive2win.torch_mlp --seed 99
+python 03_benchmark_live.py --tag v2-simple --weights nav_v2-simple.npz --seeds 42 7 99
+```
+
+Open the printed URL in your browser when asked. All 15 runs happen automatically.
+
+---
+
+## STEP 4 — Benchmark the PyTorch model on 3 seeds (browser required)
+
+```
+python 03_benchmark_live.py --tag v3-torch --weights nav_v3-torch.pt --module drive2win.torch_mlp --seeds 42 7 99
 ```
 
 ---
 
-## STEP 5 — (Optional but impressive) Ensemble v2-simple + v3-torch
+## STEP 5 — (Optional) Ensemble v2-simple + v3-torch
 
 ```
-python 03_benchmark.py --tag v4-ensemble --weights nav_v3-torch.pt --module drive2win.ensemble --seed 42
-```
-
-To benchmark with the full ensemble (both models), edit a one-liner wrapper:
-
-```python
-# drive2win/my_ensemble.py  (create this file)
-from drive2win.ensemble import make_ensemble_policy
-def make_policy(w): return make_ensemble_policy(["nav_v2-simple.npz", "nav_v3-torch.pt"])
-```
-
-Then:
-```
-python 03_benchmark.py --tag v4-ensemble --weights nav_v3-torch.pt --module drive2win.my_ensemble --seed 42
+python 03_benchmark_live.py --tag v4-ensemble --weights nav_v3-torch.pt --module drive2win.my_ensemble --seeds 42 7 99
 ```
 
 ---
