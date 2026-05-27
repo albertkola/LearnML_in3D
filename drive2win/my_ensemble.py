@@ -11,8 +11,8 @@ Edit MODELS below if you want to swap in v3-wide instead.
 from drive2win.ensemble import make_ensemble_policy
 
 MODELS = [
-    "nav_v2-simple.npz",   # NumPy 128-64-32, seed-42 data
-    "nav_v3-torch.pt",     # PyTorch 128-64-32, full data + weighted loss
+    "nav_v2-simple.npz",  # NumPy 128-64-32, seed-42 data (diversity vote)
+    "nav_v3-wide.pt",     # PyTorch 256-128-64, full data + weighted loss (best val)
 ]
 
 
