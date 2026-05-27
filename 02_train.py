@@ -100,7 +100,7 @@ def inspect_dataset(states_raw, actions, tag: str):
     viz.plot_heading_vs_steering(states_raw, actions, out=f"fig_heading_{tag}.png")
 
 
-def train(X, Y, epochs=500, lr=1e-3, batch_size=64, val_frac=0.1, seed=0):
+def train(X, Y, epochs=300, lr=1e-3, batch_size=64, val_frac=0.1, seed=0):
     rng = np.random.default_rng(seed)
     N = len(X)
     perm = rng.permutation(N); n_val = max(1, int(N * val_frac))
