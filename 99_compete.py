@@ -33,15 +33,58 @@ If the bot drives AWAY from checkpoints, flip STEER_SIGN here.
 from __future__ import annotations
 import argparse
 import json
+import math
 import threading
 import time
 import numpy as np
+import requests
 import websocket
 
 from game_client import GameClient
 from drive2win import nn as nn_mod
 from drive2win.normalize import sensors_to_input, clip_action
 from drive2win.eval import run_policy
+
+
+# ── Local sensor synthesis (tournament has no per-bot sensor stream) ─────────
+
+def _quat_to_yaw(rot: dict) -> float:
+    """Yaw around Y axis from a (x,y,z,w) quaternion."""
+    x = float(rot.get("x", 0.0))
+    y = float(rot.get("y", 0.0))
+    z = float(rot.get("z", 0.0))
+    w = float(rot.get("w", 1.0))
+    return math.atan2(2.0 * (w * y + x * z), 1.0 - 2.0 * (y * y + z * z))
+
+
+def _wrap_pi(a: float) -> float:
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _xz(pt) -> tuple[float, float]:
+    """Pull (x, z) out of a checkpoint entry (dict or [x,y,z] list)."""
+    if isinstance(pt, dict):
+        return float(pt.get("x", 0.0)), float(pt.get("z", 0.0))
+    if isinstance(pt, (list, tuple)) and len(pt) >= 3:
+        return float(pt[0]), float(pt[2])
+    return 0.0, 0.0
+
+
+def _find_checkpoints(world: dict) -> list:
+    """World-map schemas vary; pull the checkpoints list from common keys."""
+    if not isinstance(world, dict):
+        return []
+    for k in ("checkpoints", "checkpoint_positions", "track", "waypoints"):
+        v = world.get(k)
+        if isinstance(v, list) and v:
+            return v
+    nav = world.get("navigation") or world.get("course") or {}
+    if isinstance(nav, dict):
+        for k in ("checkpoints", "waypoints"):
+            v = nav.get(k)
+            if isinstance(v, list) and v:
+                return v
+    return []
 
 # ── Tunable constants ───────────────────────────────────────────────────────
 
@@ -199,6 +242,10 @@ def practice_main(args):
     client.connect_ws()
     time.sleep(0.6)
 
+    if args.no_obstacles:
+        client.configure(obstacles_enabled=False)
+        print("Obstacles disabled for this run.")
+
     policy = make_policy(args.weights)
 
     result = run_policy(client, policy, duration=args.duration, hz=20.0)
@@ -243,15 +290,57 @@ def competition_main(args):
 
     # Shared state between WS callback thread and main control loop
     latest_obs  = {"data": None}
+    latest_bot  = {"data": None}   # raw bot dict from state_update
     obs_lock    = threading.Lock()
     round_start = threading.Event()
     round_end   = threading.Event()
     tourney_end = threading.Event()
     round_meta  = {"index": 0, "seed": None, "obstacles": False}
+    world_map   = {"data": None, "checkpoints": []}
+
+    def _refresh_world_map():
+        url = f"{args.server}/api/room/{args.room}/world_map"
+        try:
+            r = requests.get(url, timeout=3)
+            if r.status_code == 200:
+                wm = r.json()
+                cps = _find_checkpoints(wm)
+                world_map["data"] = wm
+                world_map["checkpoints"] = cps
+                print(f"[world_map] fetched: keys={list(wm.keys())[:8]} "
+                      f"checkpoints={len(cps)}"
+                      f"{' first=' + str(cps[0])[:120] if cps else ''}")
+                return True
+            else:
+                print(f"[world_map] {r.status_code}: {r.text[:120]}")
+        except Exception as e:
+            print(f"[world_map] error: {e}")
+        return False
 
     def on_open(ws):
         ws.send(json.dumps({"type": "ready", "ready": True}))
         print(f"Connected — sent ready")
+
+    msg_type_counts = {}
+    my_bot_key = {"v": None}
+
+    def _extract_my_obs(bots_field):
+        """Given the 'bots' field from state_update, return our bot's obs dict."""
+        key = my_bot_key["v"]
+        if isinstance(bots_field, dict):
+            if key and key in bots_field:
+                return bots_field[key]
+            # Sometimes keyed by name instead of bot_key
+            if isinstance(bots_field.get(args.name), dict):
+                return bots_field[args.name]
+            return None
+        if isinstance(bots_field, list):
+            for b in bots_field:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("bot_key") == key or b.get("name") == args.name:
+                    return b
+        return None
 
     def on_message(ws, raw):
         try:
@@ -260,8 +349,60 @@ def competition_main(args):
             return
         t = msg.get("type", "")
 
+        # Debug: print every NEW message type once with its top-level keys
+        if t not in msg_type_counts:
+            msg_type_counts[t] = 0
+            print(f"[debug] first '{t}' msg, keys={list(msg.keys())[:12]}")
+        msg_type_counts[t] += 1
+
+        # Tournament uses state_update with our obs nested under bots[bot_key]
+        if t == "state_update":
+            my_obs = _extract_my_obs(msg.get("bots"))
+            if my_obs is not None:
+                # One-shot dump of the obs structure so we can see what's there
+                if msg_type_counts[t] == 1:
+                    print(f"[debug] my_obs keys: {list(my_obs.keys())}")
+                    print(f"[debug]   position={my_obs.get('position')}")
+                    print(f"[debug]   rotation={my_obs.get('rotation')}")
+                    print(f"[debug]   checkpoints={my_obs.get('checkpoints')} "
+                          f"laps={my_obs.get('laps')}")
+                    nav = my_obs.get("navigation")
+                    if isinstance(nav, dict):
+                        print(f"[debug] navigation keys: {list(nav.keys())} "
+                              f"sample: heading_error={nav.get('heading_error')} "
+                              f"distance={nav.get('distance')}")
+                    else:
+                        print(f"[debug] navigation field type: {type(nav).__name__} value={nav!r}")
+                    print(f"[debug] speed={my_obs.get('speed')} heading={my_obs.get('heading')} "
+                          f"rays_len={len(my_obs.get('rays', []))} "
+                          f"race_phase={my_obs.get('race_phase')}")
+                # Inject tick time if present so policies that want it can see it
+                if "t" in msg and "t" not in my_obs:
+                    my_obs = {**my_obs, "t": msg["t"]}
+                with obs_lock:
+                    latest_obs["data"] = my_obs
+                    latest_bot["data"] = my_obs   # raw bot — used to synth sensors
+            elif msg_type_counts[t] == 1:
+                bots = msg.get("bots")
+                if isinstance(bots, dict):
+                    print(f"[debug] bots dict keys: {list(bots.keys())[:6]}")
+                elif isinstance(bots, list) and bots:
+                    print(f"[debug] bots[0] keys: {list(bots[0].keys())[:12]}")
+
         if t == "bot_assigned":
+            my_bot_key["v"] = msg.get("bot_key")
             print(f"Bot key: {msg.get('bot_key')}")
+            rs = msg.get("room_state") or {}
+            if isinstance(rs, dict):
+                print(f"[debug] room_state keys: {list(rs.keys())}")
+                for k, v in rs.items():
+                    if isinstance(v, list):
+                        print(f"[debug]   room_state.{k}: list len={len(v)}"
+                              f"{' first=' + str(v[0])[:120] if v else ''}")
+                    elif isinstance(v, dict):
+                        print(f"[debug]   room_state.{k}: dict keys={list(v.keys())[:10]}")
+                    else:
+                        print(f"[debug]   room_state.{k}: {type(v).__name__}={str(v)[:80]}")
 
         elif t == "round_start":
             round_meta["index"]     = msg.get("round_index", 0)
@@ -294,6 +435,10 @@ def competition_main(args):
             if "navigation" in msg or "speed" in msg:
                 with obs_lock:
                     latest_obs["data"] = msg
+            elif isinstance(msg.get("state"), dict) and (
+                    "navigation" in msg["state"] or "speed" in msg["state"]):
+                with obs_lock:
+                    latest_obs["data"] = msg["state"]
 
     def on_error(ws, err):
         print(f"WebSocket error: {err}")
@@ -326,41 +471,88 @@ def competition_main(args):
             break
         round_start.clear()
 
+        # Fetch the world map (checkpoints) for this round — retry briefly
+        for _ in range(5):
+            if _refresh_world_map() and world_map["checkpoints"]:
+                break
+            time.sleep(0.5)
+        if not world_map["checkpoints"]:
+            print("[world_map] WARNING: no checkpoints — bot will not steer.")
+
         # Fresh policy each round — resets frame/stuck/EMA counters
-        policy  = make_policy(args.weights)
+        policy   = make_policy(args.weights)
         interval = 1.0 / 20.0
         start    = time.time()
         steps    = 0
         max_cp   = 0
         cp_start = 0
         first    = True
+        last_pos = None
+        last_t   = None
+        synth_logged = False
 
         while not round_end.is_set() and time.time() - start < ROUND_TIMEOUT:
             with obs_lock:
-                obs = latest_obs["data"]
+                bot = latest_bot["data"]
 
-            if obs:
-                # Record baseline checkpoint count at start of round
-                current_cp = int(obs.get("checkpoints_passed", 0) or 0)
+            if bot and world_map["checkpoints"]:
+                pos = bot.get("position") or {}
+                px, pz = float(pos.get("x", 0.0)), float(pos.get("z", 0.0))
+                now = time.time()
+                dt = (now - last_t) if last_t else interval
+                speed = 0.0
+                if last_pos is not None and dt > 0:
+                    speed = math.hypot(px - last_pos[0], pz - last_pos[1]) / dt
+                last_pos = (px, pz)
+                last_t = now
+
+                yaw = _quat_to_yaw(bot.get("rotation") or {})
+                cp_count = int(bot.get("checkpoints", 0) or 0)
+                cps = world_map["checkpoints"]
+                next_cp = cps[cp_count % len(cps)]
+                tx, tz = _xz(next_cp)
+                # heading 0 = looking down -Z; forward at yaw y is (sin y, 0, -cos y)
+                target_angle = math.atan2(tx - px, -(tz - pz))
+                heading_error = _wrap_pi(target_angle - yaw)
+                distance = math.hypot(tx - px, tz - pz)
+
                 if first:
-                    cp_start = current_cp
+                    cp_start = cp_count
                     first = False
-                max_cp = max(max_cp, current_cp - cp_start)
+                max_cp = max(max_cp, cp_count - cp_start)
 
-                # Only drive when race is actually running
-                phase = obs.get("race_phase", "racing")
-                if phase == "racing":
-                    state = _obs_to_state(obs)
-                    thr, steer = policy(state)
-                    try:
-                        ws.send(json.dumps({
-                            "type":     "control",
-                            "throttle": float(np.clip(thr,   -1, 1)),
-                            "steering": float(np.clip(steer, -1, 1)),
-                        }))
-                        steps += 1
-                    except Exception:
-                        break
+                synth = {
+                    "speed": speed,
+                    "heading": yaw,
+                    "rays": [50.0] * 8,
+                    "ground_friction": 1.0,
+                    "navigation": {
+                        "heading_error": heading_error,
+                        "distance": distance,
+                        "checkpoint_index": cp_count,
+                    },
+                    "checkpoints_passed": cp_count,
+                    "race_phase": "racing",
+                    "position": pos,
+                    "heading": yaw,
+                }
+                if not synth_logged:
+                    print(f"[synth] yaw={yaw:+.2f} he={heading_error:+.2f} "
+                          f"dist={distance:.1f} next_cp=({tx:.1f},{tz:.1f}) "
+                          f"speed={speed:.2f}")
+                    synth_logged = True
+
+                state = _obs_to_state(synth)
+                thr, steer = policy(state)
+                try:
+                    ws.send(json.dumps({
+                        "type":     "control",
+                        "throttle": float(np.clip(thr,   -1, 1)),
+                        "steering": float(np.clip(steer, -1, 1)),
+                    }))
+                    steps += 1
+                except Exception:
+                    break
 
             time.sleep(interval)
 
@@ -391,6 +583,8 @@ def main():
     ap.add_argument("--seed",        type=int,   default=42)
     ap.add_argument("--duration",    type=float, default=300.0)
     ap.add_argument("--api-key",     default="None")
+    ap.add_argument("--no-obstacles", action="store_true",
+                    help="Disable arena obstacles for this practice run.")
 
     # Tournament mode
     ap.add_argument("--competition", action="store_true",

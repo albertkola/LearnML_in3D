@@ -40,6 +40,8 @@ def main():
     ap.add_argument("--data", default=None,
                     help="Optional data_<tag>.npz for the training-vs-test path "
                          "overlay.")
+    ap.add_argument("--no-obstacles", action="store_true",
+                    help="Disable arena obstacles for this run.")
     ap.add_argument("--fast", action="store_true",
                     help="Run at 4x simulation speed for faster iteration.")
     args = ap.parse_args()
@@ -54,6 +56,7 @@ def main():
             weights=weights, runs=args.runs, seed=seed,
             duration=args.duration, module=args.module,
             sim_speed=4.0 if args.fast else 1.0,
+            no_obstacles=args.no_obstacles,
         )
         all_results.append({"seed": seed, **result})
 

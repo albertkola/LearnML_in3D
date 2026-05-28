@@ -1,5 +1,6 @@
 # Drive2Win — Project Checkpoint & Agent Handoff
-**Last updated:** 2026-05-27 (Session 3) | **Read this entire file before touching any code.**
+**Last updated:** 2026-05-28 (Session 4) | **Read this entire file before touching any code.**
+**Current best: 11 checkpoints in 60s, 0 crashes** (Session 4 tuning — see Section 12).
 
 ---
 
@@ -386,3 +387,72 @@ At 5 checkpoints per 60 seconds: ~25 checkpoints per 5-minute round.
 4. **Tournament**: Professor announces room name → run `python 99_compete.py --competition --room <room> --name albertkola`
 5. **Do not retrain** unless nav_v4.npz is missing — retraining risks worse performance
 6. **Do not add new features** to the policy — every addition has broken it. The 4-component policy is what works.
+
+---
+
+## 12. SESSION 4 — SPEED + STAGED RECOVERY TUNING (2026-05-28)
+
+### 12.1 Result
+**11 checkpoints in 60 seconds, 0 crashes, stuck streak 54 frames.**
+Roughly 5× faster than the Session-3 best (11 in 300s). All 11 checkpoints inside one minute, reproducible.
+
+### 12.2 What Changed (vs Session 3)
+
+| Constant | Session 3 | Session 4 | Effect |
+|---|---|---|---|
+| `ARROW_THROTTLE` | 0.75 | **1.0** | Full throttle on straights |
+| Steer-trim coefficient | 0.4 | **0.25** | Carries ≥0.75 throttle through hardest corners (was 0.6) |
+| `ARROW_BLEND_MIN` | (didn't exist) | **0.84** | Caps ML steer influence at 16% — arrow stays dominant |
+| `STUCK_THRESH` | 60 | **30** | Recovery fires at 1.5s of being stuck (was 3s) |
+| `RECOVERY_FRAMES` | 20 (then 4 + 20) | **25 (one stage)** | Unified reverse phase |
+| Recovery algorithm | 3 phases (straight → angle → forward arrow) | **Staged: straight back → mid-reverse turn → ray-based forward burst** | See 12.3 |
+| Reorient phase | 25f arrow at Kp=1.5 | **Removed** | Redundant once arrow blend ≥0.84 |
+| `AVOID_FRAMES` | (didn't exist) | **8** | Forward burst at full throttle in clearer direction |
+| `AVOID_THROTTLE` | (didn't exist) | **1.0** | Full speed after reverse |
+
+### 12.3 New Recovery Algorithm
+
+When `stuck >= STUCK_THRESH` (30 frames at speed < 0.3, past 100-frame grace):
+
+| Recovery counter | Behavior |
+|---|---|
+| 25 → 13 | Reverse straight (`thr=-1`, `steer=0`) |
+| **12** | Sample lateral rays. Pick LEFT vs RIGHT by `(x[4]+x[5])` vs `(x[10]+x[9])` clearance. Store as `avoid_dir`. |
+| 12 → 1 | Continue reversing with `steer = avoid_dir × 0.75` |
+| **0 (transition)** | **Re-sample rays** for forward-burst direction. Enter AVOID. |
+| AVOID 8 → 1 | `thr = 1.0` full speed, `steer = avoid_dir × 0.75` |
+| AVOID = 0 | Arrow + ML-blend resumes normally (no reorient) |
+
+### 12.4 Approaches Tried and Discarded
+
+- **Preemptive avoid** (trigger swerve when front ray < threshold while still moving, before any crash): made the driving line too wobbly on the open track. Removed.
+- **Sticky bias after avoid**: not implemented — current avoid + arrow handoff is clean enough.
+- **Escalating avoid on repeat-stuck**: not implemented — single-stage recovery is sufficient with the new algorithm.
+
+### 12.5 Code Cleanup
+
+- **Deleted** `drive2win/navigator.py` — unused A*/pure-pursuit path planner from earlier exploration. Nothing imported it.
+- **Removed** `client=None` parameter from `make_policy` — was accepted but never used. Updated the practice-mode call site.
+- **Cleaned** stale docstring claims about a "32×32 obstacle grid" and outdated `--student-id` arg in the file header.
+
+### 12.6 Open Tuning Knobs (For Future Sessions)
+
+If pushing further is needed:
+
+1. **Drop steer-trim further** (0.25 → 0.15) — only on clean rounds. Holds more throttle through corners.
+2. **Frame-1 EMA bypass** — currently first few frames after a checkpoint have EMA lag. Memory notes a previous "frame-1 bypass" existed; not present in current code. Could squeeze ~0.5s per checkpoint.
+3. **Conditional steer-trim** — if all rays are long (truly open), set steer-trim to 0.0 (max throttle even on corners). Only helps clean rounds, doesn't hurt obstacle rounds.
+
+**These are not implemented yet. Current performance is sufficient for tournament target.**
+
+### 12.7 Tournament-Day Reminder
+
+```powershell
+# 1. Smoke test first
+python test_bot.py --host ml.ferit.tech --secure --room albertkola
+
+# 2. Run the bot
+python 99_compete.py --competition --room <ROOM_NAME> --name albertkola
+```
+
+`nav_v4.npz` must be present in repo root. Don't retrain — the current weights + the new staged-recovery policy is the verified-working combination.

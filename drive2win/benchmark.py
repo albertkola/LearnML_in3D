@@ -66,7 +66,8 @@ def make_module_policy(module_path: str, weights_path: str):
 def run_benchmark(weights: str, runs: int = DEFAULT_RUNS, seed: int = DEFAULT_SEED,
                   duration: float = DEFAULT_DURATION, module: str | None = None,
                   server_url: str = "https://ml.ferit.tech", api_key: str = "None",
-                  player_name: str = "benchmark", sim_speed: float = 1.0) -> dict:
+                  player_name: str = "benchmark", sim_speed: float = 1.0,
+                  no_obstacles: bool = False) -> dict:
     """Run `runs` benchmark laps and return aggregate metrics.
 
     The seed is sent to the server so terrain/checkpoint layout is
@@ -89,6 +90,8 @@ def run_benchmark(weights: str, runs: int = DEFAULT_RUNS, seed: int = DEFAULT_SE
             client.connect_ws()
             if sim_speed != 1.0:
                 client.configure(sim_speed=sim_speed)
+            if no_obstacles:
+                client.configure(obstacles_enabled=False)
             time.sleep(0.6)
             print(f"\n  run {i+1}/{runs}  session={session['session_id'][:8]}…")
             result = run_policy(client, policy, duration=duration, hz=20.0)
