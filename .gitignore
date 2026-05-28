@@ -18,3 +18,7 @@ fig_*.jpg
 .vscode/
 .idea/
 .DS_Store
+
+
+CHECKPOINT.md
+project_checkpoint.md

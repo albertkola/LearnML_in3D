@@ -5,7 +5,7 @@ Usage:
     #    python train_v4.py
 
     # 2. COMPETITION MODE (tournament day — professor runs the room):
-    python 99_compete.py --competition --student-id YOUR_ID --name YOUR_NAME
+    python 99_compete.py --competition --room ROOM_NAME --name YOUR_NAME
 
     # 3. Practice / benchmark mode (time_trial):
     python 99_compete.py --weights nav_v4.npz --seed 42 --duration 300
@@ -21,7 +21,7 @@ How the hybrid works:
     │  + ML LAYER (obstacle avoidance)                    │
     │    blends in as front rays get short (< 17 m)       │
     │  + STUCK RECOVERY                                   │
-    │    forces reverse + hard steer after 60 stuck frames│
+    │    reverse → avoid (turn around obstacle) → reorient│
     │  + EMA smoothing (α=0.7)                            │
     └─────────────────────────────────────────────────────┘
 
@@ -45,18 +45,20 @@ from drive2win.eval import run_policy
 
 # ── Tunable constants ───────────────────────────────────────────────────────
 
-STEER_SIGN          = -1.0
-ARROW_STEER_KP      = 0.9
-OBSTACLE_THRESH     = 0.35
-
-GRACE_FRAMES        = 100
-STUCK_THRESH        = 60
-STUCK_SPEED         = 0.3
-RECOVERY_STRAIGHT   = 20
-RECOVERY_STEER_BACK = 4
-RECOVERY_FORWARD    = 20
-
-EMA_ALPHA           = 0.7
+STEER_SIGN      = -1.0
+ARROW_THROTTLE  = 1.0    # max throttle (revert to 0.975 if too aggressive)
+ARROW_STEER_KP  = 0.9
+OBSTACLE_THRESH = 0.35
+ARROW_BLEND_MIN = 0.84   # arrow keeps 84% of the steer vote, ML max 16%
+GRACE_FRAMES    = 100
+STUCK_THRESH    = 30   # fire recovery sooner (revert to 45 if it triggers too eagerly)
+STUCK_SPEED     = 0.3
+RECOVERY_FRAMES  = 25    # total backwards frames
+RECOVERY_TURN_AT = 12    # frames-remaining at which we start steering during reverse
+AVOID_FRAMES     = 8     # forward-burst frames after reverse (≈5 burst + 3 buffer)
+AVOID_STEER      = 0.75  # magnitude of the avoid turn (game steer units)
+AVOID_THROTTLE   = 1.0   # FULL speed during the forward burst
+EMA_ALPHA       = 0.7
 
 
 # ── Tournament obs adapter ───────────────────────────────────────────────────
@@ -82,27 +84,26 @@ def _obs_to_state(msg: dict) -> dict:
             "checkpoints_completed": int(msg.get("checkpoints_passed", 0) or 0),
         },
     }
-    return {"sensors": sensors}
+    return {
+        "sensors":  sensors,
+        "position": msg.get("position") or {},
+        "heading":  float(msg.get("heading", 0.0)),
+    }
 
 
 # ── Policy factory ───────────────────────────────────────────────────────────
 
-def make_policy(weights_path: str, client=None):
+def make_policy(weights_path: str):
     """Build the hybrid policy.
 
-    Args:
-        weights_path: path to nav_*.npz weights.
-        client: connected GameClient.  When provided, caches the world map
-                and uses the 32×32 obstacle grid for spatial avoidance.
-                When None (e.g. called from 03_benchmark.py), falls back to
-                the ray-based ML obstacle blend.
-
-    Returns:
-        policy_fn: (state_dict) -> (throttle, steering)
+    Returns a callable `(state_dict) -> (throttle, steering)` driven by the
+    arrow P-controller, blended with ML steering for close obstacles, with a
+    staged reverse → forward-burst state machine for when the car gets stuck.
     """
-    w = nn_mod.load(weights_path)
-
-    ctx = {"frame": 0, "stuck": 0, "recovery": 0, "ema_t": 0.0, "ema_s": 0.0}
+    w   = nn_mod.load(weights_path)
+    ctx = {"frame": 0, "stuck": 0, "recovery": 0,
+           "avoid": 0, "avoid_dir": 0.0,
+           "ema_t": 0.0, "ema_s": 0.0}
 
     def policy(game_state: dict) -> tuple[float, float]:
         ctx["frame"] += 1
@@ -114,45 +115,49 @@ def make_policy(weights_path: str, client=None):
         heading_error = float(sensors.get("heading_error", 0.0))
         speed         = float(sensors.get("speed", 0.0))
 
-        # ── ML forward pass ──────────────────────────────────────────────
         ml_out   = nn_mod.forward(x, w)
         ml_steer = float(ml_out[1])
 
-        # ── Arrow P-controller ───────────────────────────────────────────
         arr_steer = float(np.clip(STEER_SIGN * heading_error * ARROW_STEER_KP, -1.0, 1.0))
-        thr       = 1.0   # full throttle always
+        # Steer-trim coefficient lowered from 0.4 → 0.25 to carry more speed
+        # through corners (revert to 0.4 if the car starts losing the line).
+        thr       = ARROW_THROTTLE * (1.0 - 0.25 * abs(arr_steer))
 
-        # ── Ray-based ML steering blend ──────────────────────────────────
         front_clearance = min(float(x[3]), float(x[4]), float(x[10]))
-        obstacle_factor = float(np.clip(1.0 - front_clearance / OBSTACLE_THRESH, 0.0, 1.0))
+        # Cap ML influence at (1 - ARROW_BLEND_MIN) so arrow stays dominant.
+        obstacle_factor = float(np.clip(1.0 - front_clearance / OBSTACLE_THRESH,
+                                        0.0, 1.0 - ARROW_BLEND_MIN))
         steer = (1.0 - obstacle_factor) * arr_steer + obstacle_factor * ml_steer
 
-        # ── Recovery state machine ────────────────────────────────────────
-        _total_rec = RECOVERY_STRAIGHT + RECOVERY_STEER_BACK + RECOVERY_FORWARD
-
         if ctx["recovery"] > 0:
-            r = ctx["recovery"]
-
-            if r > RECOVERY_STEER_BACK + RECOVERY_FORWARD:
-                # Phase 1: straight reverse at full speed (~5 m)
-                thr   = -1.0
-                steer = 0.0
-
-            elif r > RECOVERY_FORWARD:
-                # Phase 2: still reversing, add gentle steer toward checkpoint (~1 m)
-                thr   = -1.0
-                steer = STEER_SIGN * (0.5 if heading_error >= 0 else -0.5)
-                # Flush EMA just before switching to forward so reverse values don't bleed
-                if r == RECOVERY_FORWARD + 1:
-                    ctx["ema_t"] = 0.0
-                    ctx["ema_s"] = 0.0
-
+            thr = -1.0
+            # At the midpoint of the reverse, sample rays and pick the side
+            # with more clearance — then steer that way while still reversing.
+            if ctx["recovery"] == RECOVERY_TURN_AT:
+                left_clr  = float(x[4]) + float(x[5])   # +45, +90
+                right_clr = float(x[10]) + float(x[9])  # -45, -90
+                # negative game steer = LEFT (STEER_SIGN = -1 convention)
+                ctx["avoid_dir"] = -1.0 if left_clr >= right_clr else 1.0
+            if ctx["recovery"] <= RECOVERY_TURN_AT:
+                steer = ctx["avoid_dir"] * AVOID_STEER
             else:
-                # Phase 3: full throttle forward, arrow steers toward checkpoint
-                thr   = 1.0
-                steer = float(np.clip(STEER_SIGN * heading_error * ARROW_STEER_KP, -1.0, 1.0))
-
+                steer = 0.0
             ctx["recovery"] -= 1
+            if ctx["recovery"] == 0:
+                # Re-sample rays once we've stopped reversing and pick the
+                # clearer forward direction, then throttle full speed that way.
+                left_clr  = float(x[4]) + float(x[5])
+                right_clr = float(x[10]) + float(x[9])
+                ctx["avoid_dir"] = -1.0 if left_clr >= right_clr else 1.0
+                ctx["avoid"]     = AVOID_FRAMES
+                ctx["ema_t"]     = 0.0
+                ctx["ema_s"]     = 0.0
+
+        elif ctx["avoid"] > 0:
+            thr   = AVOID_THROTTLE                     # full speed forward
+            steer = ctx["avoid_dir"] * AVOID_STEER
+            ctx["avoid"] -= 1
+            # When avoid expires, arrow (ARROW_BLEND_MIN = 0.84) takes back over.
 
         elif frame > GRACE_FRAMES:
             if speed < STUCK_SPEED:
@@ -160,18 +165,11 @@ def make_policy(weights_path: str, client=None):
             else:
                 ctx["stuck"] = 0
             if ctx["stuck"] >= STUCK_THRESH:
-                ctx["recovery"] = _total_rec
+                ctx["recovery"] = RECOVERY_FRAMES
                 ctx["stuck"]    = 0
 
-        # ── EMA smoothing ────────────────────────────────────────────────
-        # Frame 1: skip averaging so the car starts immediately at the correct
-        # direction instead of warming up from zero over ~10 frames.
-        if frame == 1:
-            ctx["ema_t"] = thr
-            ctx["ema_s"] = steer
-        else:
-            ctx["ema_t"] = EMA_ALPHA * thr   + (1 - EMA_ALPHA) * ctx["ema_t"]
-            ctx["ema_s"] = EMA_ALPHA * steer + (1 - EMA_ALPHA) * ctx["ema_s"]
+        ctx["ema_t"] = EMA_ALPHA * thr   + (1 - EMA_ALPHA) * ctx["ema_t"]
+        ctx["ema_s"] = EMA_ALPHA * steer + (1 - EMA_ALPHA) * ctx["ema_s"]
 
         return clip_action(np.array([ctx["ema_t"], ctx["ema_s"]]))
 
@@ -201,7 +199,7 @@ def practice_main(args):
     client.connect_ws()
     time.sleep(0.6)
 
-    policy = make_policy(args.weights, client)
+    policy = make_policy(args.weights)
 
     result = run_policy(client, policy, duration=args.duration, hz=20.0)
 
