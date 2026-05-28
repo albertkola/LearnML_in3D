@@ -22,3 +22,8 @@ fig_*.jpg
 
 CHECKPOINT.md
 project_checkpoint.md
+data_v_seed7.npz
+data_v_seed99.npz
+data_v2_recovery42.npz
+train_v4.py
+train_v5.py
