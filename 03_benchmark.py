@@ -30,8 +30,12 @@ def main():
                     help="Iteration tag, e.g. v1, v2-recovery, v3-deepnet.")
     ap.add_argument("--weights", default=None,
                     help="Path to weights file. Defaults to nav_<tag>.npz.")
-    ap.add_argument("--module", default=None,
-                    help="Optional adapter module (drive2win.cnn etc).")
+    ap.add_argument("--module", default="drive2win.agent",
+                    help="Adapter module exposing make_policy(weights). "
+                         "Defaults to drive2win.agent = the hybrid arrow+ML+recovery "
+                         "policy in 99_compete.py (the one that scored 11/12). "
+                         "Pass --module '' to benchmark the BARE neural net instead "
+                         "(wiggly, gets stuck — debug only).")
     ap.add_argument("--seeds", type=int, nargs="+", default=[42],
                     help="Map seed(s) to test on. Use one for fast iteration; "
                          "use several to test generalisation across terrains.")
